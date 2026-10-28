@@ -127,6 +127,8 @@ pub struct ConnForm {
     pub adb_devices: Option<AdbDevices>,
     /// Perfil de terminal local: intérprete en `host`, argumentos en `local_args`, carpeta en `local_cwd`.
     pub local: bool,
+    /// Motor de contenedores: `host` es el socket (vacío = detectar) y `jump` la conexión SSH.
+    pub engine: bool,
     pub local_args: String,
     pub local_cwd: String,
     pub local_vars: String,
@@ -187,6 +189,7 @@ impl ConnForm {
             adb: false,
             adb_devices: None,
             local: false,
+            engine: false,
             local_args: String::new(),
             local_cwd: String::new(),
             local_vars: String::new(),
@@ -227,7 +230,7 @@ impl ConnForm {
     }
 
     pub fn is_ssh(&self) -> bool {
-        !self.telnet && !self.serial && !self.adb && !self.local && self.files == 0
+        !self.telnet && !self.serial && !self.adb && !self.local && !self.engine && self.files == 0
     }
 
     /// Usa los campos de SSH (usuario, acceso, llave, salto): SSH y SFTP.
@@ -265,6 +268,7 @@ impl ConnForm {
             adb: connection.is_adb(),
             adb_devices: None,
             local: connection.is_local(),
+            engine: connection.is_engine(),
             local_args: if connection.is_local() { connection.user.clone() } else { String::new() },
             local_cwd: if connection.is_local() { connection.key_path.clone().unwrap_or_default() } else { String::new() },
             local_vars: connection.vars.clone(),
@@ -325,7 +329,7 @@ impl ConnForm {
                 errors.cwd = Some("Esa carpeta no existe".into());
             }
         }
-        if host.is_empty() && !self.adb && !self.local {
+        if host.is_empty() && !self.adb && !self.local && !self.engine {
             errors.host = Some(if self.serial { "Indica el puerto, por ejemplo /dev/ttyUSB0" } else { "Indica el servidor" }.into());
         }
         let mut baud = 0;
@@ -342,7 +346,7 @@ impl ConnForm {
         if self.files == 3 && self.smb_share.trim().trim_matches(['\\', '/']).is_empty() {
             errors.share = Some("Indica el recurso compartido".into());
         }
-        let port = if self.serial || self.adb || self.local {
+        let port = if self.serial || self.adb || self.local || self.engine {
             0
         } else {
             match self.port.trim().parse::<u16>() {
@@ -377,7 +381,7 @@ impl ConnForm {
             return None;
         }
         self.errors = FormErrors::default();
-        let telnet = self.telnet || self.serial || self.adb || self.local || self.files >= 2;
+        let telnet = self.telnet || self.serial || self.adb || self.local || self.engine || self.files >= 2;
         let anonymous = self.files == 2 && self.ftp_anonymous;
         let connection = Connection {
             id: self.id,
@@ -391,6 +395,8 @@ impl ConnForm {
                 Protocol::Adb
             } else if self.local {
                 Protocol::Local
+            } else if self.engine {
+                Protocol::Engine
             } else if self.serial {
                 Protocol::Serial(SerialOptions {
                     baud,
@@ -409,7 +415,7 @@ impl ConnForm {
             name,
             host,
             port,
-            user: if anonymous { "anonymous".into() } else if self.local { self.local_args.trim().to_string() } else if self.telnet || self.serial || self.adb { String::new() } else { user },
+            user: if anonymous { "anonymous".into() } else if self.local { self.local_args.trim().to_string() } else if self.telnet || self.serial || self.adb || self.engine { String::new() } else { user },
             // FTP y SMB piden la contraseña al conectar; el anónimo no la pide.
             auth: match self.files {
                 2 if anonymous => Auth::Agent,
@@ -429,7 +435,8 @@ impl ConnForm {
             } else {
                 Some(self.init_command.trim().to_string()).filter(|c| !c.is_empty() && (!telnet || self.local))
             },
-            jump: if telnet { None } else { self.jump },
+            // Un motor guarda aquí la conexión SSH por la que se llega a él.
+            jump: if self.engine || !telnet { self.jump } else { None },
             color: self.color,
             env: Some(self.env.trim().to_string()).filter(|e| !e.is_empty()),
             vars: if self.local { self.local_vars.trim().to_string() } else { String::new() },

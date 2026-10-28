@@ -69,6 +69,8 @@ pub fn connection_glyph(connection: &Connection) -> &'static str {
         icons::DOTS
     } else if connection.is_local() {
         icons::DESKTOP
+    } else if connection.is_engine() {
+        icons::CUBE
     } else {
         icons::TERMINAL
     }

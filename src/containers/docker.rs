@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
+use crate::connect::ssh::SshLink;
 use crate::terminal::term::{Backend, Feed};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,11 +35,89 @@ impl Engine {
     }
 }
 
-/// Un motor y el socket (en Windows, la tubería con nombre) por el que se le habla.
+/// Un motor y el socket por el que se le habla: en este equipo (en Windows, una tubería con nombre)
+/// o en un servidor, a través de una sesión SSH.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     pub engine: Engine,
     pub socket: PathBuf,
+    pub via: Via,
+}
+
+impl Endpoint {
+    pub fn local(engine: Engine, socket: impl Into<PathBuf>) -> Self {
+        Self { engine, socket: socket.into(), via: Via::Local }
+    }
+
+    /// Un socket elegido a mano; el motor se deduce de su ruta.
+    pub fn fixed(socket: &str, via: Via) -> Self {
+        let engine = if socket.to_lowercase().contains("podman") { Engine::Podman } else { Engine::Docker };
+        Self { engine, socket: socket.into(), via }
+    }
+}
+
+/// Por dónde se llega al socket.
+#[derive(Clone)]
+pub enum Via {
+    Local,
+    Ssh(Arc<SshLink>),
+}
+
+impl std::fmt::Debug for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Via::Local => f.write_str("Local"),
+            Via::Ssh(link) => write!(f, "Ssh({})", link.name()),
+        }
+    }
+}
+
+/// Dos `Via::Ssh` son la misma solo si comparten la sesión.
+impl PartialEq for Via {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Via::Local, Via::Local) => true,
+            (Via::Ssh(a), Via::Ssh(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Via {}
+
+/// Comprueba en el servidor los sockets habituales de Docker y Podman (de sistema y rootless) y si se
+/// pueden usar. Por el túnel, un socket inexistente y uno sin permiso dan el mismo error genérico.
+const REMOTE_PROBE: &str = r#"rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"; for s in "${DOCKER_HOST#unix://}" /var/run/docker.sock "$rt/docker.sock" /run/podman/podman.sock "$rt/podman/podman.sock"; do [ -S "$s" ] || continue; if [ -r "$s" ] && [ -w "$s" ]; then echo "ok $s"; else echo "denied $s"; fi; done"#;
+
+/// Sockets utilizables y sin permiso de la salida de `REMOTE_PROBE`, sin repetir.
+fn parse_probe(output: &str) -> (Vec<String>, Vec<String>) {
+    let (mut usable, mut denied) = (Vec::<String>::new(), Vec::<String>::new());
+    for line in output.lines() {
+        let (list, path) = match line.split_once(' ') {
+            Some(("ok", path)) => (&mut usable, path),
+            Some(("denied", path)) => (&mut denied, path),
+            _ => continue,
+        };
+        if !list.iter().any(|p| p == path) {
+            list.push(path.to_string());
+        }
+    }
+    (usable, denied)
+}
+
+/// Motores de un servidor, por SSH. Sin ninguno utilizable pero alguno sin permiso, explica cómo darlo.
+pub async fn detect_remote(link: &Arc<SshLink>) -> anyhow::Result<Vec<Endpoint>> {
+    let session = link.session().await?;
+    let output = crate::connect::ssh::run_command(&session, REMOTE_PROBE).await?;
+    let (usable, denied) = parse_probe(&output);
+    if usable.is_empty() && !denied.is_empty() {
+        bail!(
+            "Tu usuario no tiene permiso sobre {} en {}. Añádelo al grupo «docker»:\n  sudo usermod -aG docker $USER\nY vuelve a conectar.",
+            denied.join(", "),
+            link.name()
+        );
+    }
+    Ok(usable.iter().map(|socket| Endpoint::fixed(socket, Via::Ssh(link.clone()))).collect())
 }
 
 #[cfg(windows)]
@@ -55,13 +134,13 @@ pub fn detect_endpoints() -> Vec<Endpoint> {
     let mut found = Vec::new();
     let from_env = std::env::var("DOCKER_HOST").ok().and_then(|h| npipe_name(&h));
     if let Some(name) = from_env.into_iter().chain(["docker_engine".to_string()]).find(|name| exists(name)) {
-        found.push(Endpoint { engine: Engine::Docker, socket: format!("{PIPES}{name}").into() });
+        found.push(Endpoint::local(Engine::Docker, format!("{PIPES}{name}")));
     }
     // La máquina por defecto de Podman primero; si no hay, la primera por nombre.
     let mut machines: Vec<&String> = pipes.iter().filter(|p| p.starts_with("podman-machine-")).collect();
     machines.sort_by_key(|p| (p.as_str() != "podman-machine-default", p.as_str()));
     if let Some(name) = machines.first() {
-        found.push(Endpoint { engine: Engine::Podman, socket: format!("{PIPES}{name}").into() });
+        found.push(Endpoint::local(Engine::Podman, format!("{PIPES}{name}")));
     }
     found
 }
@@ -99,7 +178,7 @@ pub fn detect_endpoints() -> Vec<Endpoint> {
     let mut found = Vec::new();
     for (engine, candidates) in [(Engine::Docker, docker), (Engine::Podman, podman)] {
         if let Some(socket) = candidates.into_iter().find(|p| p.exists()) {
-            found.push(Endpoint { engine, socket });
+            found.push(Endpoint::local(engine, socket));
         }
     }
     found
@@ -261,10 +340,29 @@ impl Client {
     }
 
     async fn dial(&self) -> anyhow::Result<Stream> {
+        if let Via::Ssh(link) = &self.endpoint.via {
+            return self.dial_ssh(link).await;
+        }
         match tokio::time::timeout(TIMEOUT, connect_socket(&self.endpoint.socket)).await {
             Ok(Ok(stream)) => Ok(stream),
             Ok(Err(error)) => Err(connect_error(&self.endpoint, &error)),
             Err(_) => bail!("Tiempo de espera agotado al conectar con {}", self.endpoint.engine.name()),
+        }
+    }
+
+    /// Un canal `direct-streamlocal` hasta el socket del servidor, dentro de la sesión SSH compartida.
+    async fn dial_ssh(&self, link: &SshLink) -> anyhow::Result<Stream> {
+        let session = link.session().await?;
+        let socket = self.endpoint.socket.to_string_lossy().into_owned();
+        let opened = tokio::time::timeout(TIMEOUT, session.channel_open_direct_streamlocal(socket.clone())).await;
+        match opened {
+            Ok(Ok(channel)) => Ok(Box::new(channel.into_stream())),
+            Ok(Err(russh::Error::ChannelOpenFailure(russh::ChannelOpenFailure::AdministrativelyProhibited))) => bail!(
+                "{} no permite reenviar sockets por SSH. Activa «AllowStreamLocalForwarding yes» en su sshd_config.",
+                link.name()
+            ),
+            Ok(Err(error)) => bail!("No se pudo llegar a {socket} en {}: {error}. ¿Está {} en marcha?", link.name(), self.endpoint.engine.name()),
+            Err(_) => bail!("Tiempo de espera agotado al conectar con {} en {}", self.endpoint.engine.name(), link.name()),
         }
     }
 
@@ -338,6 +436,14 @@ impl Client {
         Ok((exec_id, stream))
     }
 
+    /// `true` si el motor está tras una sesión SSH que se ha cerrado.
+    async fn link_dropped(&self) -> bool {
+        let Via::Ssh(link) = &self.endpoint.via else { return false };
+        // El cierre del transporte llega un instante después que el del canal.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        link.is_lost()
+    }
+
     async fn resize(&self, exec_id: &str, cols: usize, rows: usize) {
         let _ = self.call("POST", &format!("/exec/{exec_id}/resize?h={rows}&w={cols}"), None, TIMEOUT).await;
     }
@@ -388,8 +494,14 @@ async fn run_shell(client: Client, id: String, name: String, size: (usize, usize
     loop {
         tokio::select! {
             read = reader.read(&mut buffer) => match read {
+                // Fin del flujo: el shell terminó, salvo que lo que se cayó fuera la sesión SSH.
                 Ok(0) => {
-                    feed.close();
+                    if client.link_dropped().await {
+                        feed.feed(red("Se perdió la conexión SSH").as_bytes());
+                        feed.disconnect();
+                    } else {
+                        feed.close();
+                    }
                     return;
                 }
                 Ok(n) => feed.feed(&buffer[..n]),
@@ -439,6 +551,16 @@ mod tests {
     #[test]
     fn chunked_bodies_are_decoded() {
         assert_eq!(dechunk(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"), b"hello world");
+    }
+
+    #[test]
+    fn the_remote_probe_separates_usable_and_denied_sockets() {
+        let output = "ok /var/run/docker.sock\ndenied /run/podman/podman.sock\nok /var/run/docker.sock\nbasura\n";
+        let (usable, denied) = parse_probe(output);
+        assert_eq!(usable, ["/var/run/docker.sock"]);
+        assert_eq!(denied, ["/run/podman/podman.sock"]);
+        assert_eq!(Endpoint::fixed("/run/user/1000/podman/podman.sock", Via::Local).engine, Engine::Podman);
+        assert_eq!(Endpoint::fixed("/var/run/docker.sock", Via::Local).engine, Engine::Docker);
     }
 
     #[test]
@@ -520,7 +642,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
         tokio::spawn(serve(listener, log.clone()));
-        (Client::new(Endpoint { engine: Engine::Docker, socket: socket.clone() }), log, socket)
+        (Client::new(Endpoint::local(Engine::Docker, socket.clone())), log, socket)
     }
 
     #[cfg(windows)]
@@ -531,7 +653,7 @@ mod tests {
         let first = ServerOptions::new().first_pipe_instance(true).create(&name).unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
         tokio::spawn(serve(name.clone(), first, log.clone()));
-        (Client::new(Endpoint { engine: Engine::Docker, socket: name.clone().into() }), log, name.into())
+        (Client::new(Endpoint::local(Engine::Docker, name.clone())), log, name.into())
     }
 
     #[tokio::test]
@@ -566,8 +688,65 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_socket_explains_itself() {
-        let client = Client::new(Endpoint { engine: Engine::Podman, socket: "/no/existe.sock".into() });
+        let client = Client::new(Endpoint::local(Engine::Podman, "/no/existe.sock"));
         let error = client.list().await.unwrap_err().to_string();
         assert!(error.contains("Podman no está en marcha"), "{error}");
+    }
+
+    /// El motor de «un servidor»: un socket Unix al que se llega por un sshd real con `direct-streamlocal`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_remote_engine_is_reached_through_an_ssh_tunnel() {
+        use crate::connect::ssh::{Credentials, JumpHost, UiEvent};
+        use crate::data::store::{Auth, Connection, Protocol};
+
+        let Some(sshd) = crate::testutil::PrivateSshd::start() else { return };
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (events, requests) = std::sync::mpsc::channel();
+        // Se confía en la huella del servidor de pruebas en cuanto se pregunta.
+        std::thread::spawn(move || {
+            for event in requests {
+                if let UiEvent::HostKey(request) = event {
+                    let _ = request.reply.send(true);
+                }
+            }
+        });
+        let server = Connection {
+            id: Some(1),
+            protocol: Protocol::Ssh,
+            name: "servidor".into(),
+            host: "127.0.0.1".into(),
+            port: sshd.port,
+            user: sshd.user.clone(),
+            auth: Auth::Key,
+            key_path: Some(sshd.key_path.clone()),
+            init_command: None,
+            jump: None,
+            color: None,
+            env: None,
+            vars: String::new(),
+        };
+        let link = Arc::new(SshLink::new(JumpHost { connection: server, credentials: Credentials::default() }, events, Arc::new(|| {}), sshd.dir.join("known_hosts")));
+        let socket = sshd.dir.join("docker.sock");
+
+        runtime.block_on(async {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            tokio::spawn(serve(tokio::net::UnixListener::bind(&socket).unwrap(), log.clone()));
+            let client = Client::new(Endpoint::fixed(socket.to_str().unwrap(), Via::Ssh(link.clone())));
+
+            assert_eq!(client.list().await.unwrap().len(), 3);
+            client.act("bbb222", Action::Start).await.unwrap();
+            let (_, mut stream) = client.exec("aaa111", (80, 24)).await.unwrap();
+            let mut prompt = [0u8; 2];
+            stream.read_exact(&mut prompt).await.unwrap();
+            assert_eq!(&prompt, b"# ");
+            assert!(!link.is_lost());
+            assert!(log.lock().unwrap().iter().any(|l| l.starts_with("POST /containers/bbb222/start")));
+
+            // Un socket que no existe en el servidor da un error que nombra la conexión.
+            let missing = Client::new(Endpoint::fixed("/no/existe.sock", Via::Ssh(link.clone())));
+            let error = missing.list().await.unwrap_err().to_string();
+            assert!(error.contains("servidor"), "{error}");
+        });
     }
 }

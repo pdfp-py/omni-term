@@ -71,7 +71,8 @@ impl App {
     }
 
     pub(super) fn close_tab(&mut self, index: usize) {
-        self.tabs.remove(index);
+        let tab = self.tabs.remove(index);
+        self.container_shells.remove(&tab.id);
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len().saturating_sub(1);
         } else if index < self.active {

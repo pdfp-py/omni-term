@@ -8,7 +8,8 @@ use eframe::egui::{self, Align, FontId, Layout, Rect, RichText, Sense, Ui, UiBui
 use tokio::runtime::Handle;
 
 use crate::ui::cursor::HandExt;
-use crate::containers::docker::{self, Action, Client, Container, Endpoint};
+use crate::connect::ssh::SshLink;
+use crate::containers::docker::{self, Action, Client, Container, Endpoint, Via};
 use crate::ui::theme;
 use crate::ui::kit::IconButton;
 
@@ -25,6 +26,17 @@ struct Snapshot {
     error: Option<String>,
 }
 
+/// De dónde salen los motores de la pestaña.
+#[derive(Clone)]
+pub enum Source {
+    /// Los que se detecten en este equipo.
+    Here,
+    /// Un socket concreto de este equipo (perfil con socket fijado).
+    Socket(String),
+    /// Un servidor por SSH; sin socket, se detectan al conectar.
+    Remote { link: Arc<SshLink>, socket: Option<String> },
+}
+
 /// Lo que la vista le pide a la aplicación.
 pub enum Request {
     Terminal(Endpoint, Container),
@@ -33,7 +45,12 @@ pub enum Request {
 }
 
 pub struct ContainersView {
-    endpoints: Vec<Endpoint>,
+    title: String,
+    source: Source,
+    endpoints: Arc<Mutex<Vec<Endpoint>>>,
+    /// Buscando motores (en un servidor, conectando por SSH).
+    detecting: Arc<AtomicBool>,
+    redetect: Arc<AtomicBool>,
     selected: usize,
     current: Arc<Mutex<Option<Endpoint>>>,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -55,11 +72,15 @@ impl Drop for ContainersView {
 }
 
 impl ContainersView {
-    pub fn new(runtime: Handle, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let endpoints = docker::detect_endpoints();
+    /// `title` distingue la pestaña de un perfil («Contenedores · prod»); la de este equipo es «Contenedores».
+    pub fn new(runtime: Handle, wake: Arc<dyn Fn() + Send + Sync>, source: Source, title: String) -> Self {
         let view = Self {
-            current: Arc::new(Mutex::new(endpoints.first().cloned())),
-            endpoints,
+            title,
+            source,
+            current: Arc::new(Mutex::new(None)),
+            endpoints: Arc::new(Mutex::new(Vec::new())),
+            detecting: Arc::new(AtomicBool::new(true)),
+            redetect: Arc::new(AtomicBool::new(true)),
             selected: 0,
             snapshot: Arc::new(Mutex::new(Snapshot::default())),
             last_seen: Arc::new(Mutex::new(Instant::now())),
@@ -77,7 +98,28 @@ impl ContainersView {
     }
 
     pub fn label(&self) -> String {
-        "Contenedores".into()
+        self.title.clone()
+    }
+
+    /// El motor elegido ahora, para abrir un shell que reconecta.
+    pub fn current_endpoint(&self) -> Option<Endpoint> {
+        self.current.lock().unwrap().clone()
+    }
+
+    fn link(&self) -> Option<&Arc<SshLink>> {
+        match &self.source {
+            Source::Remote { link, .. } => Some(link),
+            _ => None,
+        }
+    }
+
+    /// Vuelve a conectar con el servidor y a buscar sus motores.
+    pub fn reconnect(&mut self) {
+        if let Some(link) = self.link() {
+            link.reconnect();
+        }
+        *self.snapshot.lock().unwrap() = Snapshot::default();
+        self.redetect.store(true, Ordering::SeqCst);
     }
 
     /// Avisos de acciones terminadas (o fallidas) para mostrarlos como notificación.
@@ -88,9 +130,36 @@ impl ContainersView {
     fn start_polling(&self) {
         let (current, snapshot, last_seen, refresh, stop, wake) =
             (self.current.clone(), self.snapshot.clone(), self.last_seen.clone(), self.refresh.clone(), self.stop.clone(), self.wake.clone());
+        let (source, endpoints, detecting, redetect) = (self.source.clone(), self.endpoints.clone(), self.detecting.clone(), self.redetect.clone());
         self.runtime.spawn(async move {
             let mut last_fetch: Option<Instant> = None;
             while !stop.load(Ordering::SeqCst) {
+                if redetect.swap(false, Ordering::SeqCst) {
+                    detecting.store(true, Ordering::SeqCst);
+                    wake();
+                    let found = match &source {
+                        Source::Here => Ok(docker::detect_endpoints()),
+                        Source::Socket(socket) => Ok(vec![Endpoint::fixed(socket, Via::Local)]),
+                        Source::Remote { link, socket: Some(socket) } => link.session().await.map(|_| vec![Endpoint::fixed(socket, Via::Ssh(link.clone()))]),
+                        Source::Remote { link, socket: None } => docker::detect_remote(link).await,
+                    };
+                    match found {
+                        Ok(found) => {
+                            *current.lock().unwrap() = found.first().cloned();
+                            *endpoints.lock().unwrap() = found;
+                        }
+                        Err(error) => {
+                            endpoints.lock().unwrap().clear();
+                            *current.lock().unwrap() = None;
+                            let mut snapshot = snapshot.lock().unwrap();
+                            snapshot.loaded = true;
+                            snapshot.error = Some(format!("{error:#}"));
+                        }
+                    }
+                    detecting.store(false, Ordering::SeqCst);
+                    last_fetch = None;
+                    wake();
+                }
                 let forced = refresh.swap(false, Ordering::SeqCst);
                 let visible = last_seen.lock().unwrap().elapsed() < STALE_AFTER;
                 let due = last_fetch.is_none_or(|t| t.elapsed() >= REFRESH_EVERY);
@@ -141,14 +210,15 @@ impl ContainersView {
 
     fn select(&mut self, index: usize) {
         self.selected = index;
-        *self.current.lock().unwrap() = self.endpoints.get(index).cloned();
+        *self.current.lock().unwrap() = self.endpoints.lock().unwrap().get(index).cloned();
         *self.snapshot.lock().unwrap() = Snapshot::default();
         self.refresh.store(true, Ordering::SeqCst);
     }
 
     fn redetect(&mut self) {
-        self.endpoints = docker::detect_endpoints();
-        self.select(0);
+        self.selected = 0;
+        *self.snapshot.lock().unwrap() = Snapshot::default();
+        self.redetect.store(true, Ordering::SeqCst);
     }
 
     pub fn show(&mut self, ui: &mut Ui, area: Rect) -> Option<Request> {
@@ -158,13 +228,10 @@ impl ContainersView {
         let ui = &mut child;
         ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
 
-        self.header(ui);
+        let endpoints = self.endpoints.lock().unwrap().clone();
+        self.header(ui, &endpoints);
         ui.add_space(theme::space::XS);
 
-        if self.endpoints.is_empty() {
-            self.empty(ui);
-            return None;
-        }
         let (loaded, error, containers) = {
             let snapshot = self.snapshot.lock().unwrap();
             (snapshot.loaded, snapshot.error.clone(), snapshot.containers.clone())
@@ -172,9 +239,31 @@ impl ContainersView {
         if let Some(error) = error {
             ui.add_space(theme::space::L);
             ui.label(RichText::new(error).color(theme::red()));
-            if ui.button("Reintentar").hand().clicked() {
-                self.refresh.store(true, Ordering::SeqCst);
+            // Con la sesión SSH caída hay que reconectar; si no, basta con volver a intentarlo.
+            if self.link().is_some_and(|link| link.is_lost()) {
+                if ui.button("Reconectar").hand().clicked() {
+                    self.reconnect();
+                }
+            } else if ui.button("Reintentar").hand().clicked() {
+                if endpoints.is_empty() {
+                    self.redetect();
+                } else {
+                    self.refresh.store(true, Ordering::SeqCst);
+                }
             }
+            return None;
+        }
+        if self.detecting.load(Ordering::SeqCst) {
+            ui.add_space(theme::space::L);
+            let text = match self.link() {
+                Some(link) => format!("Conectando con {}…", link.name()),
+                None => "Buscando motores…".to_string(),
+            };
+            ui.label(RichText::new(text).color(theme::subtext()));
+            return None;
+        }
+        if endpoints.is_empty() {
+            self.empty(ui);
             return None;
         }
         if !loaded {
@@ -197,7 +286,7 @@ impl ContainersView {
             ui.label(RichText::new(text).color(theme::subtext()));
             return None;
         }
-        let endpoint = self.endpoints[self.selected.min(self.endpoints.len() - 1)].clone();
+        let endpoint = endpoints[self.selected.min(endpoints.len() - 1)].clone();
         let busy = self.busy.lock().unwrap().clone();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
@@ -210,21 +299,24 @@ impl ContainersView {
         request
     }
 
-    fn header(&mut self, ui: &mut Ui) {
+    fn header(&mut self, ui: &mut Ui, endpoints: &[Endpoint]) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Contenedores").font(FontId::new(theme::size::HEADING, crate::ui::strong_family())).color(theme::text()));
-            if self.endpoints.len() > 1 {
+            ui.label(RichText::new(&self.title).font(FontId::new(theme::size::HEADING, crate::ui::strong_family())).color(theme::text()));
+            if endpoints.len() > 1 {
                 ui.add_space(theme::space::M);
+                // Con dos del mismo motor (de sistema y rootless) se distinguen por el socket.
+                let repeated = |engine| endpoints.iter().filter(|e| e.engine == engine).count() > 1;
                 let mut chosen = None;
-                for (index, endpoint) in self.endpoints.iter().enumerate() {
-                    if ui.selectable_label(index == self.selected, endpoint.engine.name()).hand().clicked() && index != self.selected {
+                for (index, endpoint) in endpoints.iter().enumerate() {
+                    let label = if repeated(endpoint.engine) { format!("{} · {}", endpoint.engine.name(), endpoint.socket.display()) } else { endpoint.engine.name().to_string() };
+                    if ui.selectable_label(index == self.selected, label).hand().clicked() && index != self.selected {
                         chosen = Some(index);
                     }
                 }
                 if let Some(index) = chosen {
                     self.select(index);
                 }
-            } else if let Some(endpoint) = self.endpoints.first() {
+            } else if let Some(endpoint) = endpoints.first() {
                 ui.label(RichText::new(endpoint.engine.name()).color(theme::subtext()));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -239,8 +331,14 @@ impl ContainersView {
 
     fn empty(&mut self, ui: &mut Ui) {
         ui.add_space(theme::space::XXL);
-        ui.label(RichText::new("No se encontró Docker ni Podman").font(FontId::new(theme::size::HEADING, crate::ui::strong_family())).color(theme::text()));
-        let places = if cfg!(windows) {
+        let title = match self.link() {
+            Some(link) => format!("No se encontró Docker ni Podman en {}", link.name()),
+            None => "No se encontró Docker ni Podman".to_string(),
+        };
+        ui.label(RichText::new(title).font(FontId::new(theme::size::HEADING, crate::ui::strong_family())).color(theme::text()));
+        let places = if self.link().is_some() {
+            "Inicia el motor en el servidor y vuelve a buscar. Se buscan DOCKER_HOST, /var/run/docker.sock, los sockets rootless del usuario y los de Podman."
+        } else if cfg!(windows) {
             "Inicia Docker Desktop o la máquina de Podman y vuelve a buscar. Se busca la tubería de DOCKER_HOST, \\\\.\\pipe\\docker_engine y las de podman-machine."
         } else {
             "Inicia el motor y vuelve a buscar. Se buscan sus sockets en /var/run/docker.sock, en DOCKER_HOST y en el directorio de ejecución del usuario."

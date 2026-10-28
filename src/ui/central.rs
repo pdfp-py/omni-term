@@ -180,7 +180,7 @@ impl App {
                 self.window_title = title;
             }
 
-            if disconnected && self.tabs[active].kind != TabKind::Container {
+            if disconnected {
                 let mut clicked = false;
                 egui::Area::new(egui::Id::NULL.with("reconnect"))
                     .pivot(Align2::CENTER_BOTTOM)

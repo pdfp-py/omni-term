@@ -38,3 +38,4 @@ pub const CLOUD_UP: &str = "\u{E1AE}";
 pub const HARD_DRIVES: &str = "\u{E2A0}";
 pub const PHONE: &str = "\u{E1E0}";
 pub const DESKTOP: &str = "\u{E560}";
+pub const CUBE: &str = "\u{E1DA}";

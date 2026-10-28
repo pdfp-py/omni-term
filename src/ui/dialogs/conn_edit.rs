@@ -268,11 +268,12 @@ pub(super) enum ConnKind {
     Smb,
     Adb,
     Local,
+    Engine,
 }
 
 impl ConnKind {
     /// (tipo, nombre, grupo): la lista pone un encabezado cada vez que cambia el grupo.
-    const ALL: [(ConnKind, &'static str, &'static str); 8] = [
+    const ALL: [(ConnKind, &'static str, &'static str); 9] = [
         (ConnKind::Ssh, "SSH", "Terminal"),
         (ConnKind::Telnet, "Telnet", "Terminal"),
         (ConnKind::Serial, "Puerto serie", "Terminal"),
@@ -281,9 +282,13 @@ impl ConnKind {
         (ConnKind::Ftp, "FTP / FTPS", "Archivos"),
         (ConnKind::Smb, "SMB", "Archivos"),
         (ConnKind::Adb, "Android (ADB)", "Otros"),
+        (ConnKind::Engine, "Contenedores", "Otros"),
     ];
 
     pub(super) fn of(form: &ConnForm) -> Self {
+        if form.engine {
+            return ConnKind::Engine;
+        }
         match (form.files, form.adb, form.serial, form.telnet, form.local) {
             (1, ..) => ConnKind::Sftp,
             (2, ..) => ConnKind::Ftp,
@@ -301,6 +306,7 @@ impl ConnKind {
         form.adb = self == ConnKind::Adb;
         form.serial = self == ConnKind::Serial;
         form.local = self == ConnKind::Local;
+        form.engine = self == ConnKind::Engine;
         form.files = match self {
             ConnKind::Sftp => 1,
             ConnKind::Ftp => 2,
@@ -323,6 +329,7 @@ impl ConnKind {
             ConnKind::Smb => icons::HARD_DRIVES,
             ConnKind::Adb => icons::PHONE,
             ConnKind::Local => icons::DESKTOP,
+            ConnKind::Engine => icons::CUBE,
         }
     }
 }
@@ -372,6 +379,38 @@ pub(super) fn kind_list(ui: &mut egui::Ui, form: &mut ConnForm) {
 pub(super) fn detected_shells(ctx: &egui::Context) -> std::sync::Arc<Vec<crate::connect::local::ShellOption>> {
     let id = Id::NULL.with("detected-shells");
     ctx.data_mut(|d| d.get_temp_mut_or_insert_with::<std::sync::Arc<Vec<crate::connect::local::ShellOption>>>(id, || std::sync::Arc::new(crate::connect::local::available_shells())).clone())
+}
+
+/// Filas de un motor de contenedores: dónde está (este equipo o un servidor por SSH) y su socket.
+pub(super) fn engine_rows(ui: &mut egui::Ui, form: &mut ConnForm, connections: &[Connection]) {
+    let servers: Vec<&Connection> = connections.iter().filter(|c| c.id != form.id && c.is_ssh()).collect();
+    crate::ui::kit::form_row(ui, "Ubicación", |ui| {
+        let current = form.jump.and_then(|id| servers.iter().find(|c| c.id == Some(id))).map_or("Este equipo".to_string(), |c| format!("{} ({})", c.name, c.destination()));
+        ComboBox::from_id_salt("engine-place")
+            .width(ui.available_width())
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut form.jump, None, "Este equipo");
+                for server in &servers {
+                    ui.selectable_value(&mut form.jump, server.id, format!("{} ({})", server.name, server.destination()));
+                }
+            })
+            .response
+            .hand();
+        let hint = if servers.is_empty() {
+            "Para un servidor, crea antes su conexión SSH: el motor usa su usuario, llave y saltos."
+        } else {
+            "En un servidor se entra con su conexión SSH y se habla con el motor por un túnel al socket, sin abrir puertos."
+        };
+        ui.label(RichText::new(hint).small().color(theme::subtext()));
+    });
+    ui.add_space(theme::space::ROW);
+    crate::ui::kit::form_row(ui, "Socket", |ui| {
+        let width = ui.available_width();
+        crate::ui::kit::text_input(ui, &mut form.host, width, "detectar al conectar", &mut form.errors.host);
+        crate::ui::kit::error_line(ui, &form.errors.host);
+        ui.label(RichText::new("Vacío busca Docker y Podman (también rootless). Indícalo solo si está en otro sitio.").small().color(theme::subtext()));
+    });
 }
 
 /// Filas de un perfil de terminal local: intérprete, argumentos, carpeta inicial, comando inicial y variables.
@@ -682,6 +721,10 @@ pub(super) fn form_fields(ui: &mut egui::Ui, form: &mut ConnForm, connections: &
         adb_rows(ui, form);
         return false;
     }
+    if kind == ConnKind::Engine {
+        engine_rows(ui, form, connections);
+        return false;
+    }
     crate::ui::kit::form_row(ui, "Servidor", |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -696,7 +739,7 @@ pub(super) fn form_fields(ui: &mut egui::Ui, form: &mut ConnForm, connections: &
         ConnKind::Ssh | ConnKind::Sftp => ssh_access_rows(ui, form),
         ConnKind::Ftp | ConnKind::Smb => files_rows(ui, form),
         ConnKind::Telnet => telnet_rows(ui, form),
-        ConnKind::Serial | ConnKind::Adb | ConnKind::Local => {}
+        ConnKind::Serial | ConnKind::Adb | ConnKind::Local | ConnKind::Engine => {}
     }
     if matches!(kind, ConnKind::Ssh | ConnKind::Sftp) {
         ui.add_space(theme::space::GROUP);

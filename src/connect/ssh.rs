@@ -300,6 +300,108 @@ pub async fn test_connection(
     Ok(format!("Conexión correcta: {}@{}:{}", connection.user, connection.host, connection.port))
 }
 
+/// Ejecuta `command` en el servidor sin PTY y devuelve su salida estándar.
+pub(crate) async fn run_command(session: &Handle<Client>, command: &str) -> anyhow::Result<String> {
+    let mut channel = session.channel_open_session().await.context("abriendo un canal para ejecutar un comando")?;
+    channel.exec(true, command).await.context("ejecutando un comando en el servidor")?;
+    let mut output = Vec::new();
+    while let Some(message) = channel.wait().await {
+        match message {
+            ChannelMsg::Data { data } => output.extend_from_slice(&data),
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
+enum LinkState {
+    /// Se puede conectar (la primera vez, o tras pedir «Reconectar»).
+    Idle,
+    Up(Arc<Handle<Client>>),
+    /// La conexión falló o se cayó: no se reintenta sola, para no repetir preguntas de 2FA.
+    Lost(String),
+}
+
+/// Una sesión SSH compartida (lista de contenedores y sus shells) que se abre al usarla por primera vez.
+pub struct SshLink {
+    target: JumpHost,
+    events: std_mpsc::Sender<UiEvent>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    known_hosts: std::path::PathBuf,
+    state: tokio::sync::Mutex<LinkState>,
+}
+
+impl SshLink {
+    pub fn new(target: JumpHost, events: std_mpsc::Sender<UiEvent>, wake: Arc<dyn Fn() + Send + Sync>, known_hosts: std::path::PathBuf) -> Self {
+        Self { target, events, wake, known_hosts, state: tokio::sync::Mutex::new(LinkState::Idle) }
+    }
+
+    /// Nombre de la conexión SSH, para los mensajes.
+    pub fn name(&self) -> &str {
+        &self.target.connection.name
+    }
+
+    /// La sesión abierta; la abre si aún no se ha intentado o si se pidió reconectar.
+    pub async fn session(&self) -> anyhow::Result<Arc<Handle<Client>>> {
+        let mut state = self.state.lock().await;
+        if let LinkState::Up(session) = &*state {
+            if !session.is_closed() {
+                return Ok(session.clone());
+            }
+            *state = LinkState::Lost(format!("Se perdió la conexión con {}", self.name()));
+        }
+        if let LinkState::Lost(reason) = &*state {
+            bail!("{reason}");
+        }
+        let connection = &self.target.connection;
+        let opened = establish(
+            connection,
+            &self.target.credentials,
+            self.events.clone(),
+            self.wake.clone(),
+            self.known_hosts.clone(),
+            Arc::new(Mutex::new(Vec::new())),
+            new_tunnels(&[]),
+        )
+        .await
+        .with_context(|| format!("conectando con {}", connection.name));
+        match opened {
+            Ok(session) => {
+                let session = Arc::new(session);
+                *state = LinkState::Up(session.clone());
+                Ok(session)
+            }
+            Err(error) => {
+                *state = LinkState::Lost(format!("{error:#}"));
+                Err(error)
+            }
+        }
+    }
+
+    /// `true` cuando la conexión falló o se cayó y espera a que se pida reconectar.
+    pub fn is_lost(&self) -> bool {
+        match self.state.try_lock() {
+            Ok(state) => match &*state {
+                LinkState::Lost(_) => true,
+                LinkState::Up(session) => session.is_closed(),
+                LinkState::Idle => false,
+            },
+            // Conectando ahora mismo.
+            Err(_) => false,
+        }
+    }
+
+    /// Permite volver a conectar en el próximo uso. Si ahora mismo se está conectando, no hace falta.
+    pub fn reconnect(&self) {
+        if let Ok(mut state) = self.state.try_lock() {
+            if !matches!(&*state, LinkState::Up(session) if !session.is_closed()) {
+                *state = LinkState::Idle;
+            }
+        }
+    }
+}
+
 /// `true` si la llave privada necesita passphrase.
 pub fn key_is_encrypted(path: &str) -> anyhow::Result<bool> {
     match russh::keys::load_secret_key(expand_home(path), None) {

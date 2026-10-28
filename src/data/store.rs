@@ -328,6 +328,9 @@ pub enum Protocol {
     /// Perfil de terminal local: intérprete en `host` (vacío = el del sistema), argumentos en `user`,
     /// directorio inicial en `key_path` y variables de entorno en `Connection::vars`.
     Local,
+    /// Motor de contenedores (Docker o Podman). Se llega por la conexión SSH guardada en `jump`, o en este
+    /// equipo si no hay; el socket va en `host` (vacío = detectarlo al conectar).
+    Engine,
 }
 
 impl Protocol {
@@ -340,6 +343,7 @@ impl Protocol {
             Protocol::Files(kind) => ("files", false, "utf8", false, Some(kind.to_text())),
             Protocol::Adb => ("adb", false, "utf8", false, None),
             Protocol::Local => ("local", false, "utf8", false, None),
+            Protocol::Engine => ("engine", false, "utf8", false, None),
         }
     }
 
@@ -350,6 +354,7 @@ impl Protocol {
             "files" => Protocol::Files(FilesKind::parse(serial.unwrap_or(""))),
             "adb" => Protocol::Adb,
             "local" => Protocol::Local,
+            "engine" => Protocol::Engine,
             _ => Protocol::Ssh,
         }
     }
@@ -414,6 +419,15 @@ impl Connection {
         self.protocol == Protocol::Local
     }
 
+    pub fn is_engine(&self) -> bool {
+        self.protocol == Protocol::Engine
+    }
+
+    /// Socket fijado a mano de un motor de contenedores; `None` lo detecta al conectar.
+    pub fn engine_socket(&self) -> Option<&str> {
+        Some(self.host.trim()).filter(|s| !s.is_empty())
+    }
+
     /// Nombre corto del intérprete de un perfil local, o «shell del sistema» si no se eligió uno.
     pub fn local_shell_name(&self) -> String {
         let program = self.host.trim();
@@ -443,6 +457,7 @@ impl Connection {
             Protocol::Files(FilesKind::Smb) => "SMB",
             Protocol::Adb => "ADB",
             Protocol::Local => "Local",
+            Protocol::Engine => "Contenedores",
         }
     }
 
@@ -457,6 +472,16 @@ impl Connection {
             Protocol::Adb if self.host.is_empty() => "el dispositivo conectado".to_string(),
             Protocol::Adb => self.host.clone(),
             Protocol::Local => self.local_shell_name(),
+            Protocol::Engine => self.engine_place(),
+        }
+    }
+
+    /// Dónde está un motor: su socket si se fijó; si no, si es de este equipo o remoto.
+    fn engine_place(&self) -> String {
+        match (self.engine_socket(), self.jump) {
+            (Some(socket), _) => socket.to_string(),
+            (None, Some(_)) => "servidor SSH".to_string(),
+            (None, None) => "este equipo".to_string(),
         }
     }
 
@@ -469,6 +494,7 @@ impl Connection {
             Protocol::Adb if self.host.is_empty() => "adb · el dispositivo conectado".to_string(),
             Protocol::Adb => format!("adb · {}", self.host),
             Protocol::Local => format!("local · {}", self.local_shell_name()),
+            Protocol::Engine => format!("contenedores · {}", self.engine_place()),
             Protocol::Files(FilesKind::Sftp) => format!("sftp · {}@{}", self.user, self.host),
             Protocol::Files(FilesKind::Ftp(o)) => {
                 let who = if o.anonymous { "anónimo" } else { self.user.as_str() };
@@ -1303,6 +1329,30 @@ mod tests {
         assert_eq!(back.local_shell_name(), "zsh");
         assert_eq!(back.target(), "local · zsh");
         assert!(loaded.iter().find(|c| c.name == "web").unwrap().vars.is_empty());
+    }
+
+    #[test]
+    fn an_engine_keeps_its_ssh_connection_and_socket() {
+        let store = Store::open_in_memory().unwrap();
+        let server = store.save_connection(&sample("prod")).unwrap();
+        let mut remote = sample("prod · contenedores");
+        remote.protocol = Protocol::Engine;
+        remote.host = String::new();
+        remote.jump = Some(server);
+        let remote = store.save_connection(&remote).unwrap();
+        let mut local = sample("podman");
+        local.protocol = Protocol::Engine;
+        local.host = "/run/user/1000/podman/podman.sock".into();
+        local.jump = None;
+        let local = store.save_connection(&local).unwrap();
+
+        let loaded = store.list_connections().unwrap();
+        let remote = loaded.iter().find(|c| c.id == Some(remote)).unwrap();
+        assert!(remote.is_engine());
+        assert_eq!((remote.jump, remote.engine_socket()), (Some(server), None));
+        assert_eq!(remote.target(), "contenedores · servidor SSH");
+        let local = loaded.iter().find(|c| c.id == Some(local)).unwrap();
+        assert_eq!((local.jump, local.engine_socket()), (None, Some("/run/user/1000/podman/podman.sock")));
     }
 
     #[test]

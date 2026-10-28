@@ -133,6 +133,8 @@ pub struct App {
     open_plus_menu: bool,
     /// Última pestaña a la que se desplazó la tira de pestañas.
     tab_strip_seen: u64,
+    /// Shells de contenedor por id de pestaña: su motor y el nombre del contenedor, para reconectar.
+    container_shells: HashMap<u64, (docker::Endpoint, String)>,
     /// La barra de menú oculta se muestra de paso (tras pulsar Alt).
     menu_peek: bool,
     /// Alt pulsado: `true` si ya se pulsó otra tecla mientras tanto.
@@ -277,6 +279,7 @@ impl App {
             plus_selected: 0,
             open_plus_menu: false,
             tab_strip_seen: 0,
+            container_shells: HashMap::new(),
             menu_peek: false,
             alt_state: None,
             sidebar_width,

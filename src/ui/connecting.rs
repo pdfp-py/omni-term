@@ -93,6 +93,18 @@ impl App {
     pub(super) fn begin_open(&mut self, connection: Connection, slot: Option<u64>, purpose: Purpose) {
         // Las conexiones de archivos no tienen terminal: abrirlas es abrir su explorador.
         let purpose = if connection.is_files() && matches!(purpose, Purpose::Terminal) { Purpose::Explorer(None, None) } else { purpose };
+        if connection.is_engine() {
+            if !matches!(purpose, Purpose::Terminal) {
+                self.notify("Un motor de contenedores no tiene explorador de archivos ni paneles");
+                return;
+            }
+            // Volver a abrir el mismo motor lleva a su pestaña en lugar de duplicarla.
+            let open = self.tabs.iter().position(|t| t.kind == TabKind::Connection(connection.id.unwrap_or(-1)) && matches!(t.body, Body::Containers(_)));
+            if let Some(index) = open {
+                self.active = index;
+                return;
+            }
+        }
         if connection.is_local() {
             if matches!(purpose, Purpose::Explorer(..)) {
                 self.notify("Un terminal local no tiene explorador de archivos");
@@ -171,6 +183,7 @@ impl App {
         }
         let retry = Retry::Open(connection.clone(), slot, purpose.clone());
         let result = match purpose {
+            Purpose::Terminal if connection.is_engine() => self.open_engine(connection, credentials),
             Purpose::Terminal => self.open_ssh(connection, credentials, slot),
             Purpose::Explorer(local, remote) => self.open_explorer(connection, credentials, (local, remote)),
             Purpose::Pane { tab, target } => self.open_ssh_pane(connection, credentials, tab, target),

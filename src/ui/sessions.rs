@@ -109,35 +109,80 @@ impl App {
             self.active = index;
             return;
         }
-        let view = ContainersView::new(self.runtime.handle().clone(), self.wake());
+        let view = ContainersView::new(self.runtime.handle().clone(), self.wake(), view::Source::Here, "Contenedores".into());
         let id = self.take_tab_id();
         self.tabs.push(Tab { id, kind: TabKind::Containers, label: "Contenedores".into(), custom: None, attention: false, body: Body::Containers(Box::new(view)) });
         self.active = self.tabs.len() - 1;
     }
 
-    /// Terminal dentro de un contenedor, en una pestaña nueva.
-    pub(super) fn open_container_terminal(&mut self, endpoint: docker::Endpoint, container: &docker::Container) {
+    /// Pestaña de contenedores de un perfil de motor: en este equipo o en un servidor por SSH.
+    pub(super) fn open_engine(&mut self, connection: Connection, credentials: Credentials) -> anyhow::Result<()> {
+        let Some(id) = connection.id else { anyhow::bail!("la conexión no está guardada") };
+        let socket = connection.engine_socket().map(str::to_string);
+        let source = match (credentials.jump, connection.jump) {
+            (Some(server), _) => {
+                let link = ssh::SshLink::new(*server, self.events_tx.clone(), self.wake(), ssh::default_known_hosts());
+                view::Source::Remote { link: Arc::new(link), socket }
+            }
+            (None, Some(_)) => anyhow::bail!("La conexión SSH de este motor ya no existe: edítalo y elige otra."),
+            (None, None) => match socket {
+                Some(socket) => view::Source::Socket(socket),
+                None => view::Source::Here,
+            },
+        };
+        let title = format!("Contenedores · {}", connection.name);
+        let view = ContainersView::new(self.runtime.handle().clone(), self.wake(), source, title.clone());
+        let tab_id = self.take_tab_id();
+        self.tabs.push(Tab { id: tab_id, kind: TabKind::Connection(id), label: title, custom: None, attention: false, body: Body::Containers(Box::new(view)) });
+        self.active = self.tabs.len() - 1;
+        Ok(())
+    }
+
+    /// Sesión de un shell dentro de un contenedor. Se abre por nombre, que sobrevive a que se recree.
+    fn container_session(&mut self, endpoint: docker::Endpoint, name: String) -> anyhow::Result<Session> {
         let wake = self.wake();
         let handle = self.runtime.handle().clone();
         let (cols, rows) = self.grid;
         let options = self.term_options();
-        let (id, name) = (container.id.clone(), container.name.clone());
-        let started = Session::start(cols, rows, options, move || wake(), move |feed| Ok(docker::spawn(&handle, endpoint, id, name.clone(), (cols, rows), feed)));
-        match started {
+        Session::start(cols, rows, options, move || wake(), move |feed| Ok(docker::spawn(&handle, endpoint, name.clone(), name, (cols, rows), feed)))
+    }
+
+    /// Terminal dentro de un contenedor, en una pestaña nueva.
+    pub(super) fn open_container_terminal(&mut self, endpoint: docker::Endpoint, container: &docker::Container) {
+        let label = match &endpoint.via {
+            docker::Via::Ssh(link) => format!("{} · {}", container.name, link.name()),
+            docker::Via::Local => container.name.clone(),
+        };
+        match self.container_session(endpoint.clone(), container.name.clone()) {
             Ok(session) => {
                 let tab_id = self.take_tab_id();
                 let body = Body::terminal(Pane::new(session, self.debug_keys, 1), None);
-                self.tabs.push(Tab { id: tab_id, kind: TabKind::Container, label: container.name.clone(), custom: None, attention: false, body });
+                self.tabs.push(Tab { id: tab_id, kind: TabKind::Container, label, custom: None, attention: false, body });
+                self.container_shells.insert(tab_id, (endpoint, container.name.clone()));
                 self.active = self.tabs.len() - 1;
             }
             Err(error) => self.dialog = Some(Dialog::failure("No se pudo abrir el terminal", format!("{error:#}"))),
         }
     }
 
-    /// Ejecuta una acción confirmada sobre un contenedor con el administrador abierto.
+    /// Abre un shell nuevo en el mismo contenedor; si la sesión SSH del motor se cayó, se reconecta antes.
+    fn reconnect_container(&mut self, index: usize) {
+        let tab_id = self.tabs[index].id;
+        let Some((endpoint, name)) = self.container_shells.get(&tab_id).cloned() else { return };
+        // Permite reconectar; el shell nuevo abre la sesión al conectar.
+        if let docker::Via::Ssh(link) = &endpoint.via {
+            link.reconnect();
+        }
+        match self.container_session(endpoint, name) {
+            Ok(session) => self.tabs[index].body = Body::terminal(Pane::new(session, self.debug_keys, 1), None),
+            Err(error) => self.dialog = Some(Dialog::failure("No se pudo reabrir el terminal", format!("{error:#}"))),
+        }
+    }
+
+    /// Ejecuta una acción confirmada sobre un contenedor, en la pestaña del motor al que pertenece.
     pub(super) fn container_action(&mut self, confirm: dialogs::ContainerConfirm) {
         let view = self.tabs.iter().find_map(|t| match &t.body {
-            Body::Containers(view) => Some(view),
+            Body::Containers(view) if view.current_endpoint().as_ref() == Some(&confirm.endpoint) => Some(view),
             _ => None,
         });
         if let Some(view) = view {
@@ -260,6 +305,10 @@ impl App {
     }
 
     pub(super) fn reconnect(&mut self, index: usize) {
+        if self.tabs[index].kind == TabKind::Container {
+            self.reconnect_container(index);
+            return;
+        }
         let (TabKind::Connection(id), tab_id) = (self.tabs[index].kind, self.tabs[index].id) else { return };
         let split_focus = match &self.tabs[index].body {
             Body::Terminal { panes, focused, .. } if panes.len() > 1 => Some(*focused),
